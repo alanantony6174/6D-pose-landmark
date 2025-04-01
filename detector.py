@@ -9,21 +9,25 @@ class YOLOOBBDetector:
         """
         self.model = YOLO(model_path)
 
-    def predict_enlarged_bbox(self, image, scale_factor: float = 1.25):
+    def predict_enlarged_bbox(self, image, scale_factor: float = 1.25, conf_threshold: float = 0.25):
         """
         Processes an input image and returns a list of detections containing only the enlarged bounding boxes.
         :param image: Input image (numpy array, BGR format).
         :param scale_factor: Factor by which to enlarge the detected bounding boxes.
+        :param conf_threshold: Minimum confidence score to consider a detection.
         :return: List of detections. Each detection is a dictionary with:
                  'name': class name,
                  'bbox': enlarged bounding box points (numpy array of shape (N, 1, 2)),
                  'confidence': confidence score.
         """
-        results = self.model(image)
+        results = self.model(image, conf=conf_threshold, verbose=False)  # Set confidence and disable verbose logging
         detections = []
 
         for result in results:
             for obb in result.obb:
+                if obb.conf < conf_threshold:  # Ensure filtering at this level as well
+                    continue
+                
                 # Ensure (N,2) shape for the polygon points.
                 xyxyxyxy = obb.xyxyxyxy.cpu().numpy().reshape(-1, 2)
                 conf = obb.conf.item()
