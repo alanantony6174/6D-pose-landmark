@@ -1,0 +1,5 @@
+numpy
+opencv-python
+pyrealsense2
+scipy
+ultralytics
