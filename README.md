@@ -52,7 +52,7 @@ This project demonstrates a complete pipeline for detecting objects with YOLO, e
 
 ```
 .
-├── AlphadroidTM_logo-01_Super_Tool.jpg  # Reference image for rotation marker estimation
+├── /path/to/reference_image.jpg  # Reference image for rotation marker estimation
 ├── detector.py                          # YOLO detector implementation
 ├── main.py                              # Main script for pipeline setup and processing
 ├── models

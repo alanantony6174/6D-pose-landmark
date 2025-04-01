@@ -40,7 +40,7 @@ pose_estimator = PoseEstimator(color_intrinsics)
 
 # Initialize the YOLO detector.
 model_path = "models/alpha-1.pt"  # Adjust this path if needed
-detector = YOLOOBBDetector(model_path, )
+detector = YOLOOBBDetector(model_path)
 
 # Initialize the Rotation Marker Estimator.
 ref_img_path = "AlphadroidTM_logo-01_Super_Tool.jpg"
