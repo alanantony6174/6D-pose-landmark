@@ -2,28 +2,21 @@ import pyrealsense2 as rs
 import numpy as np
 import cv2
 import json
-from scipy.spatial.transform import Rotation as R
-#import matplotlib.pyplot as plt  # for 3D plotting
-#from mpl_toolkits.mplot3d import Axes3D  # required for 3D plotting
-#from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # for drawing polygons in 3D
- 
-#plt.ion()  # enable interactive mode for matplotlib
- 
+from pose import PoseEstimator
+from detector import YOLOOBBDetector  # Import the YOLO detector
+
 # Global image dimensions (as used in the pipeline)
 COLOR_WIDTH, COLOR_HEIGHT = 640, 480
- 
-# ------------------------------------
-# Helper function: Clamp point to image bounds
-# ------------------------------------
+
+# ------------------------------
+# Helper functions in main.py
+# ------------------------------
 def clamp_point(pt, width=COLOR_WIDTH, height=COLOR_HEIGHT):
     """Clamp (x, y) coordinates so that they lie within the image boundaries."""
     x = max(0, min(width - 1, pt[0]))
     y = max(0, min(height - 1, pt[1]))
     return (int(x), int(y))
- 
-# ------------------------------------
-# Helper function: Square detection
-# ------------------------------------
+
 def find_squares(image, min_area=1000):
     """Detect square-like contours in an image and ignore ones with small area."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -40,12 +33,12 @@ def find_squares(image, min_area=1000):
                 continue
             squares.append(approx)
     return squares
- 
-# ------------------------------------
-# Helper function: Order square corners
-# Returns points in order: top-left, top-right, bottom-right, bottom-left
-# ------------------------------------
+
 def order_points(pts):
+    """
+    Order square corners in the following order: 
+    top-left, top-right, bottom-right, bottom-left.
+    """
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -55,52 +48,41 @@ def order_points(pts):
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
- 
-# ------------------------------------
-# Helper function: Get average depth over a window
-# ------------------------------------
-def get_average_depth(depth_frame, x, y, window_size=3):
-    """Return the average depth value around (x, y) over a window."""
-    half = window_size // 2
-    depths = []
-    for i in range(-half, half + 1):
-        for j in range(-half, half + 1):
-            x_idx = int(round(x)) + i
-            y_idx = int(round(y)) + j
-            if x_idx < 0 or y_idx < 0:
-                continue
-            depth = depth_frame.get_distance(x_idx, y_idx)
-            if depth > 0:
-                depths.append(depth)
-    return np.mean(depths) if depths else depth_frame.get_distance(int(round(x)), int(round(y)))
- 
-# ================================
+
+# =====================================
 # Initialize RealSense Pipeline
-# ================================
+# =====================================
 pipeline = rs.pipeline()
 config = rs.config()
- 
+
 color_width, color_height = COLOR_WIDTH, COLOR_HEIGHT
 depth_width, depth_height = 640, 480
 fps = 30
- 
+
 config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, fps)
 config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, fps)
- 
+
 profile = pipeline.start(config)
 align_to = rs.stream.color
 align = rs.align(align_to)
- 
+
 depth_sensor = profile.get_device().first_depth_sensor()
 depth_scale = depth_sensor.get_depth_scale()
 print("Depth Scale is:", depth_scale)
- 
+
 color_profile = profile.get_stream(rs.stream.color)
 color_intrinsics = color_profile.as_video_stream_profile().get_intrinsics()
 print("Camera Intrinsics:", color_intrinsics)
- 
-print("Starting stream. Continuously detecting square, computing pose and showing overlay.")
- 
+
+# Create an instance of the PoseEstimator with the camera intrinsics.
+pose_estimator = PoseEstimator(color_intrinsics)
+
+# Initialize the YOLO detector.
+model_path = "models/alpha-1.pt"  # Adjust this path if needed
+detector = YOLOOBBDetector(model_path)
+
+print("Starting stream. Detecting YOLO bounding boxes, computing squares inside them, and overlaying pose.")
+
 try:
     while True:
         frames = pipeline.wait_for_frames()
@@ -109,100 +91,92 @@ try:
         depth_frame = aligned_frames.get_depth_frame()
         if not color_frame or not depth_frame:
             continue
- 
+
         color_image = np.asanyarray(color_frame.get_data())
- 
-        # Detect squares (ignoring small ones) and draw their contours.
-        squares = find_squares(color_image, min_area=1000)
-        for square in squares:
-            cv2.polylines(color_image, [square], isClosed=True, color=(0, 255, 0), thickness=2)
- 
-        # If a square is detected, compute and overlay pose.
-        if len(squares) > 0:
-            square = squares[0]
-            ordered_corners = order_points(square)  # [tl, tr, br, bl]
-            for pt in ordered_corners:
-                cv2.circle(color_image, clamp_point(pt), 4, (255, 0, 0), -1)
-            tl, tr, br, bl = ordered_corners
- 
-            # Compute deprojected 3D corners using averaged depth.
-            tl_depth = get_average_depth(depth_frame, tl[0], tl[1], window_size=3)
-            tr_depth = get_average_depth(depth_frame, tr[0], tr[1], window_size=3)
-            br_depth = get_average_depth(depth_frame, br[0], br[1], window_size=3)
-            bl_depth = get_average_depth(depth_frame, bl[0], bl[1], window_size=3)
-            tl_3d = np.array(rs.rs2_deproject_pixel_to_point(color_intrinsics, [tl[0], tl[1]], tl_depth))
-            tr_3d = np.array(rs.rs2_deproject_pixel_to_point(color_intrinsics, [tr[0], tr[1]], tr_depth))
-            br_3d = np.array(rs.rs2_deproject_pixel_to_point(color_intrinsics, [br[0], br[1]], br_depth))
-            bl_3d = np.array(rs.rs2_deproject_pixel_to_point(color_intrinsics, [bl[0], bl[1]], bl_depth))
- 
-            # Define the square plane using the four corners.
-            plane_normal = np.cross(tr_3d - tl_3d, bl_3d - tl_3d)
-            norm_plane = np.linalg.norm(plane_normal)
-            if norm_plane < 1e-6:
-                continue  # Skip frame if normal is too small
-            plane_normal = plane_normal / norm_plane
-            if plane_normal[2] < 0:
-                plane_normal = -plane_normal
- 
-            # Define x-axis as the normalized top edge (from tl to tr)
-            x_axis = tr_3d - tl_3d
-            norm_x = np.linalg.norm(x_axis)
-            if norm_x < 1e-6:
-                continue  # Skip frame if top edge is degenerate
-            x_axis = x_axis / norm_x
- 
-            # Define y-axis as the cross product of plane_normal and x_axis.
-            y_axis = np.cross(plane_normal, x_axis)
-            norm_y = np.linalg.norm(y_axis)
-            if norm_y < 1e-6:
-                continue  # Skip frame if y_axis is degenerate
-            y_axis = y_axis / norm_y
- 
-            # Compute center of the square as the average of the four corners.
-            center_3d = (tl_3d + tr_3d + br_3d + bl_3d) / 4
- 
-            # Compute rotation matrix and quaternion (columns: x_axis, y_axis, plane_normal)
-            rotation_matrix = np.column_stack((x_axis, y_axis, plane_normal))
-            try:
-                quaternion = R.from_matrix(rotation_matrix).as_quat()
-            except Exception as e:
-                print("Quaternion computation failed:", e)
-                continue  # Skip this frame if SVD did not converge
- 
-            print("Fitted Plane Normal:", plane_normal)
-            print("Rotation Matrix:\n", rotation_matrix)
-            print("Quaternion (x, y, z, w):", quaternion)
-            text = f"Quat: {np.round(quaternion, 2)}"
-            cv2.putText(color_image, text, clamp_point((10, 30)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (255, 255, 255), 2)
- 
-            # Draw the 2D pose overlay.
-            axis_length = 0.1  # in meters; adjust as needed
-            center_2d = rs.rs2_project_point_to_pixel(color_intrinsics, center_3d.tolist())
-            x_endpoint_3d = (center_3d + x_axis * axis_length).tolist()
-            x_endpoint_2d = rs.rs2_project_point_to_pixel(color_intrinsics, x_endpoint_3d)
-            y_endpoint_3d = (center_3d + y_axis * axis_length).tolist()
-            y_endpoint_2d = rs.rs2_project_point_to_pixel(color_intrinsics, y_endpoint_3d)
-            z_endpoint_3d = (center_3d + plane_normal * axis_length).tolist()
-            z_endpoint_2d = rs.rs2_project_point_to_pixel(color_intrinsics, z_endpoint_3d)
-            cv2.line(color_image, clamp_point(center_2d), clamp_point(x_endpoint_2d),
-                     (0, 0, 255), 2)
-            cv2.line(color_image, clamp_point(center_2d), clamp_point(y_endpoint_2d),
-                     (0, 255, 0), 2)
-            cv2.line(color_image, clamp_point(center_2d), clamp_point(z_endpoint_2d),
-                     (255, 0, 0), 2)
-            cv2.circle(color_image, clamp_point(center_2d), 3, (255, 255, 255), -1)
-            # Also draw the top edge (yellow) for verification.
-            cv2.line(color_image, clamp_point(tl), clamp_point(tr), (0, 255, 255), 2)
-            cv2.putText(color_image, "Top Edge", clamp_point((tl[0], tl[1] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
- 
-        # Display the final image in one window.
-        cv2.imshow("RealSense", color_image)
+        display_image = color_image.copy()  # For drawing overlays
+
+        # Get YOLO detections on the full color image.
+        detections = detector.predict_enlarged_bbox(color_image, scale_factor=1.3)
+        for det in detections:
+            # Each detection provides a quadrilateral bbox
+            bbox_poly = det["bbox"]  # e.g., shape (4, 1, 2)
+            name = det["name"]
+            conf = det["confidence"]
+
+            # Draw the YOLO bounding box in red.
+            #cv2.polylines(display_image, [bbox_poly], isClosed=True, color=(0, 0, 255), thickness=2)
+            # Put class name and confidence on the image.
+            # We use the top-left corner of the bounding box (after converting to a standard tuple)
+            tl_point = tuple(bbox_poly[0][0])
+            # cv2.putText(display_image, f"{name} {conf:.2f}",
+            #             (tl_point[0], tl_point[1] - 10),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Compute axis-aligned bounding rectangle from the quadrilateral.
+            x, y, w, h = cv2.boundingRect(bbox_poly)
+
+            # Crop the region of interest (ROI) from the color image.
+            roi = color_image[y:y+h, x:x+w]
+            if roi.size == 0:
+                continue
+
+            # Detect squares inside the ROI using the unchanged find_squares function.
+            squares = find_squares(roi, min_area=1000)
+            if len(squares) > 0:
+                # Process only the first square found in the ROI.
+                square = squares[0]
+                # Adjust square coordinates back to the full image space.
+                square += np.array([[[x, y]]])
+                cv2.polylines(display_image, [square], isClosed=True, color=(0, 255, 0), thickness=2)
+                
+                # Order the corners: [tl, tr, br, bl]
+                ordered_corners = order_points(square)
+                for pt in ordered_corners:
+                    cv2.circle(display_image, clamp_point(pt), 4, (255, 0, 0), -1)
+
+                # Compute pose for the detected square.
+                try:
+                    pose_info = pose_estimator.estimate_pose(ordered_corners, depth_frame, axis_length=0.1)
+                except Exception as e:
+                    print("Pose estimation error:", e)
+                    continue
+
+                plane_normal = pose_info['plane_normal']
+                rotation_matrix = pose_info['rotation_matrix']
+                quaternion = pose_info['quaternion']
+                endpoints_2d = pose_info['endpoints_2d']
+
+                print("Fitted Plane Normal:", plane_normal)
+                print("Rotation Matrix:\n", rotation_matrix)
+                print("Quaternion (x, y, z, w):", quaternion)
+                text = f"Quat: {np.round(quaternion, 2)}"
+                cv2.putText(display_image, text, clamp_point((10, 30)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 255), 2)
+
+                # Draw the pose axes overlay.
+                cv2.line(display_image, clamp_point(endpoints_2d['center']), clamp_point(endpoints_2d['x']),
+                         (0, 0, 255), 2)
+                cv2.line(display_image, clamp_point(endpoints_2d['center']), clamp_point(endpoints_2d['y']),
+                         (0, 255, 0), 2)
+                cv2.line(display_image, clamp_point(endpoints_2d['center']), clamp_point(endpoints_2d['z']),
+                         (255, 0, 0), 2)
+                cv2.circle(display_image, clamp_point(endpoints_2d['center']), 3, (255, 255, 255), -1)
+                # Draw the top edge (yellow) for verification.
+                tl = ordered_corners[0]
+                tr = ordered_corners[1]
+                cv2.line(display_image, clamp_point(tl), clamp_point(tr), (0, 255, 255), 2)
+                cv2.putText(display_image, "Top Edge", clamp_point((tl[0], tl[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                # If you wish to process only the first valid detection, you can break here.
+                # break
+
+        # Display the final image with overlays.
+        cv2.imshow("RealSense with YOLO ROI", display_image)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
- 
+
 except Exception as e:
     print("Exception occurred:", e)
 finally:
